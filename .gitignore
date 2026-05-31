@@ -44,3 +44,9 @@ next-env.d.ts
 /scripts/
 /scratch/
 
+# metadata, instructions, and schemas
+AGENTS.md
+CLAUDE.md
+schema.sql
+README.md
+
