@@ -4,12 +4,20 @@ import { upsertReceipt } from '@/lib/receipt-helpers';
 
 export async function POST(request: Request) {
   try {
+    // Verify webhook signature
+    const flutterwaveHash = request.headers.get('verif-hash');
+    const secretHash = process.env.FLUTTERWAVE_ENCRYPTION_KEY;
+
+    if (!flutterwaveHash || flutterwaveHash !== secretHash) {
+      console.warn('Invalid webhook signature — request rejected');
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const payload = await request.json();
     console.log('Ingested Flutterwave Webhook Payload:', payload);
 
     const { event, data } = payload;
 
-    // Check event and status
     if (event !== 'charge.completed' || data?.status !== 'successful') {
       return NextResponse.json({ message: 'Ignored non-success event' }, { status: 200 });
     }
@@ -21,10 +29,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Missing transaction reference (tx_ref)' }, { status: 400 });
     }
 
-    // DB Operations: Run inside a transaction
     await query('BEGIN');
 
-    // 1. Fetch the demand bill by reference_number (tx_ref)
     const baseTxRef = tx_ref.split('_')[0];
     const billRes = await query(`
       SELECT 
@@ -53,7 +59,6 @@ export async function POST(request: Request) {
     const bill = billRes.rows[0];
     const { demand_bill_id, lg_id, client_id, created_by, state_id, khrien_split_percentage } = bill;
 
-    // If already marked as fully paid, skip processing but commit/return ok
     if (bill.payment_status === 'paid') {
       await query('COMMIT');
       return NextResponse.json({ status: 'success', message: 'Bill already fully paid.' }, { status: 200 });
@@ -61,7 +66,6 @@ export async function POST(request: Request) {
 
     const flwRef = flw_ref || tx_ref;
 
-    // Check if this payment is already processed to prevent duplicate processing
     const paymentCheck = await query(`
       SELECT id FROM payments WHERE transaction_id = $1
     `, [flwRef]);
@@ -71,7 +75,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ status: 'success', message: 'Payment already processed.' }, { status: 200 });
     }
 
-    // 2. Compute payment totals
     const paymentAmount = parseFloat(amount);
     const newAmountPaid = bill.amount_paid + paymentAmount;
     const newBalanceDue = Math.max(0, bill.total_amount - newAmountPaid);
@@ -88,7 +91,6 @@ export async function POST(request: Request) {
       WHERE id = $5
     `, [newStatus, flwRef, newAmountPaid, newBalanceDue, demand_bill_id]);
 
-    // 3. Create demand bill status log with metadata
     const logChangeType = newBalanceDue === 0 ? 'payment_completed_flutterwave' : 'partial_payment_flutterwave';
     const logNote = newBalanceDue === 0
       ? `Full payment settled via Flutterwave. Transaction ID: ${flwRef}`
@@ -106,13 +108,11 @@ export async function POST(request: Request) {
       VALUES ($1, $2, 'System (Flutterwave)', $3, $4, $5)
     `, [demand_bill_id, newStatus, logChangeType, logNote, JSON.stringify(logMetadata)]);
 
-    // 4. Insert payments record
     await query(`
       INSERT INTO payments (bill_id, transaction_id, amount, currency, status, payment_date, raw_payload)
       VALUES ($1, $2, $3, 'NGN', 'successful', NOW(), $4)
     `, [demand_bill_id, flwRef, paymentAmount, JSON.stringify(payload)]);
 
-    // 5. Upsert receipt (on every payment)
     await upsertReceipt({
       demandBillId: demand_bill_id,
       lgId: lg_id,
@@ -130,18 +130,15 @@ export async function POST(request: Request) {
       paymentDate: new Date().toISOString(),
     });
 
-    // 6. Check if platform transaction already logged to prevent duplicate splits
     const ptCheck = await query(`
       SELECT id FROM platform_transactions WHERE flutterwave_transaction_id = $1
     `, [flwRef]);
 
     if (ptCheck.rows.length === 0) {
-      // 7. Calculate splits
       const splitPct = parseFloat(khrien_split_percentage) || 5.00;
       const khrienShare = paymentAmount * (splitPct / 100);
       const lgShare = paymentAmount - khrienShare;
 
-      // 8. Insert Platform Transaction
       await query(`
         INSERT INTO platform_transactions (
           lg_id, 
